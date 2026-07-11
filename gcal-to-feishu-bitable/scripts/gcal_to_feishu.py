@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import argparse
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,28 +31,45 @@ GWS_ENV = {**os.environ, "HTTP_PROXY": "", "HTTPS_PROXY": "", "http_proxy": "", 
 # ── gws helpers ──────────────────────────────────────────────────────────────
 
 def _parse_gws_json(raw_stdout):
-    """从 gws 输出中提取 JSON（跳过 keyring 提示行等非 JSON 前缀）。"""
+    """从 gws 输出中提取 JSON（跳过 keyring 提示行等非 JSON 前缀）。
+    支持两种格式：
+    - 单个 JSON 对象（未分页 / 单行单页）
+    - NDJSON 多页（--page-all）：每页一行 JSON 对象，合并所有页的 items
+    """
     lines = raw_stdout.strip().split("\n")
-    json_start = 0
-    for i, line in enumerate(lines):
-        if line.strip().startswith("{"):
-            json_start = i
-            break
-    json_str = "\n".join(lines[json_start:])
-    try:
-        return json.loads(json_str)
-    except json.JSONDecodeError:
-        items = []
-        for line in lines[json_start:]:
-            line = line.strip()
-            if line:
-                try:
-                    items.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
-        if items:
-            return {"items": items} if len(items) > 1 else items[0]
+    json_lines = []
+    started = False
+    for line in lines:
+        if not started:
+            if line.strip().startswith("{"):
+                started = True
+                json_lines.append(line)
+        else:
+            json_lines.append(line)
+
+    if not json_lines:
         return None
+
+    joined = "\n".join(json_lines)
+    # 情况1：整体是单个合法 JSON（未分页，或 --page-all 只有一页且单行输出）
+    try:
+        return json.loads(joined)
+    except json.JSONDecodeError:
+        pass
+
+    # 情况2：NDJSON 多页，逐行解析，合并所有页的 items
+    items = []
+    for line in json_lines:
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            page = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(page, dict) and isinstance(page.get("items"), list):
+            items.extend(page["items"])
+    return {"items": items} if items else None
 
 
 def _run_gws_auth_login():
@@ -124,18 +142,31 @@ def try_get_calendars_with_auth():
     return None
 
 
-def run_gws(args):
+def run_gws(args, retries=0):
+    """运行 gws 命令并解析 JSON。retries>0 时失败自动重试，指数退避。失败返回 None。"""
     cmd = ["gws"] + args
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=GWS_ENV)
-    if result.returncode != 0:
+    for attempt in range(retries + 1):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=GWS_ENV)
+        except subprocess.TimeoutExpired:
+            if attempt < retries:
+                time.sleep(2 ** attempt)
+                continue
+            print(f"gws 命令超时: {' '.join(cmd)}", file=sys.stderr)
+            return None
+        if result.returncode == 0:
+            return _parse_gws_json(result.stdout)
+        if attempt < retries:
+            time.sleep(2 ** attempt)
+            continue
         print(f"gws 命令失败: {' '.join(cmd)}", file=sys.stderr)
         print(result.stderr, file=sys.stderr)
         return None
-    return _parse_gws_json(result.stdout)
+    return None
 
 
 def get_calendar_list():
-    data = run_gws(["calendar", "calendarList", "list", "--page-all"])
+    data = run_gws(["calendar", "calendarList", "list", "--page-all"], retries=2)
     if not data or "items" not in data:
         print("无法获取日历列表", file=sys.stderr)
         return []
@@ -143,15 +174,19 @@ def get_calendar_list():
 
 
 def get_events_for_day(cal_id, date_str):
+    """返回 (events, error)。成功 (list, None)；失败 ([], error_str)，不再静默返回空。"""
+    next_day = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
     params = json.dumps({
         "calendarId": cal_id,
         "timeMin": f"{date_str}T00:00:00+08:00",
-        "timeMax": f"{date_str}T23:59:59+08:00",
+        "timeMax": f"{next_day}T00:00:00+08:00",  # Google API timeMax 对 start time 是 exclusive，用次日 00:00 含盖全天
         "singleEvents": True,
         "orderBy": "startTime",
     })
-    data = run_gws(["calendar", "events", "list", "--params", params])
-    return data.get("items", []) if data else []
+    data = run_gws(["calendar", "events", "list", "--params", params, "--page-all"], retries=3)
+    if data is None:
+        return [], "gws 请求失败（重试 3 次后仍失败）"
+    return (data.get("items", []) if data else []), None
 
 
 def parse_dt_to_ms(dt_str):
@@ -191,7 +226,9 @@ def ensure_select_options(needed_names, dry_run):
         print(f"无法获取角色分类字段定义: {data}", file=sys.stderr)
         return False
 
-    field_def = data.get("data") or {}
+    # +field-get 返回结构为 data.data.field.{options,name,multiple,...}
+    inner = data.get("data") or {}
+    field_def = inner.get("field") or inner  # 兼容两种可能的层级
     current_options = field_def.get("options") or []
     existing_names = {opt["name"] for opt in current_options}
 
@@ -226,36 +263,36 @@ def ensure_select_options(needed_names, dry_run):
 
 
 def get_existing_record_ids(date_str):
-    """返回表中 日期 字段属于 date_str 当天的所有 record_id。
-    API 返回格式: data.data = rows[], data.fields = column names[], data.record_id_list = ids[]
-    日期字段值为 'YYYY-MM-DD HH:MM:SS' 字符串。
+    """返回表中 日期 字段等于 date_str 当天的所有 record_id。
+    用 --filter-json ExactDate 精确命中当天 + offset 翻页，确保取完（不依赖单页上限）。
     """
-    data = run_lark([
-        "base", "+record-list",
-        "--base-token", BASE_TOKEN,
-        "--table-id", TABLE_ID,
-        "--format", "json",
-        "--limit", "200",
-    ])
-    if not data.get("ok"):
-        return []
-
-    inner = data.get("data") or {}
-    fields = inner.get("fields") or []
-    rows = inner.get("data") or []
-    record_ids = inner.get("record_id_list") or []
-
-    try:
-        date_idx = fields.index("日期")
-    except ValueError:
-        return []
-
+    filter_json = json.dumps({
+        "logic": "and",
+        "conditions": [["日期", "==", f"ExactDate({date_str})"]],
+    }, ensure_ascii=False)
     ids = []
-    for rid, row in zip(record_ids, rows):
-        date_val = row[date_idx] if date_idx < len(row) else None
-        # 日期值格式: "2026-06-27 08:00:00"，取前10位比较
-        if isinstance(date_val, str) and date_val[:10] == date_str:
-            ids.append(rid)
+    offset = 0
+    limit = 200
+    while True:
+        data = run_lark([
+            "base", "+record-list",
+            "--base-token", BASE_TOKEN,
+            "--table-id", TABLE_ID,
+            "--format", "json",
+            "--filter-json", filter_json,
+            "--limit", str(limit),
+            "--offset", str(offset),
+        ])
+        if not data.get("ok"):
+            print(f"拉取已有记录失败: {data}", file=sys.stderr)
+            return ids  # 返回已拿到的部分
+
+        inner = data.get("data") or {}
+        record_ids = inner.get("record_id_list") or []
+        ids.extend(record_ids)
+        if len(record_ids) < limit:
+            break
+        offset += limit
     return ids
 
 
@@ -289,6 +326,48 @@ def batch_create_records(rows, dry_run):
     return True
 
 
+# ── blank slots ───────────────────────────────────────────────────────────────
+
+BLANK_TITLE = "空白未记录时间"
+
+
+def compute_blank_slots(busy_intervals, day_start_ms, day_end_ms):
+    """计算一天中忙碌区间之外的真正空白段。
+    busy_intervals: [(start_ms, end_ms), ...]（已截断到当天边界）
+    返回 [(start_ms, end_ms), ...]，与忙碌区间拼接严格覆盖 [day_start, day_end] = 24h。
+    重叠/相邻的忙碌区间先合并，再取补集；跳过零长度空白。
+    """
+    # 按开始时间排序，合并重叠/相邻区间
+    merged = []
+    for s, e in sorted(busy_intervals, key=lambda x: x[0]):
+        if e <= s:
+            continue  # 跳过无效区间
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+
+    # 在 [day_start, day_end] 上取补集
+    blanks = []
+    cursor = day_start_ms
+    for s, e in merged:
+        if s > cursor:
+            blanks.append((cursor, s))
+        cursor = max(cursor, e)
+    if cursor < day_end_ms:
+        blanks.append((cursor, day_end_ms))
+    return blanks
+
+
+def fmt_time(ms, day_start_ms, day_end_ms):
+    """毫秒 -> HH:MM，当天边界用 00:00 / 24:00 表示。"""
+    if ms == day_start_ms:
+        return "00:00"
+    if ms == day_end_ms:
+        return "24:00"
+    return datetime.fromtimestamp(ms / 1000, tz=TZ_CST).strftime("%H:%M")
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -316,13 +395,19 @@ def main():
         sys.exit(1)
     print(f"查询 {len(targets)} 个日历...")
 
-    # 2. 并发拉取事件
+    # 2. 并发拉取事件（失败日历告警但不终止，保证其余日历继续）
     all_events = []  # [(cal_name, event), ...]
+    failed_cals = []
     with ThreadPoolExecutor(max_workers=len(targets)) as pool:
         futures = {pool.submit(get_events_for_day, cid, date_str): name for name, cid in targets}
         for future in as_completed(futures):
             cal_name = futures[future]
-            events = future.result()
+            events, error = future.result()
+            if error:
+                failed_cals.append(cal_name)
+                print(f"⚠️  日历 [{cal_name}] 拉取失败：{error}", file=sys.stderr)
+                print(f"    其事件未计入，相关时段会被误算为空白", file=sys.stderr)
+                continue
             for ev in events:
                 all_events.append((cal_name, ev))
 
@@ -331,6 +416,7 @@ def main():
 
     # 3. 过滤全天事件，组装 rows；跨天事件截断到当天 00:00~24:00
     rows = []
+    busy_intervals = []
     for cal_name, ev in all_events:
         start_obj = ev.get("start", {})
         end_obj = ev.get("end", {})
@@ -355,39 +441,58 @@ def main():
         cross_day = raw_start_ms < day_start_ms or raw_end_ms > day_end_ms
         row = [title, day_start_ms, start_ms, end_ms, cal_name, "Google Calendar", description]
         rows.append(row)
-        start_time = "00:00" if start_ms == day_start_ms and raw_start_ms < day_start_ms else datetime.fromtimestamp(start_ms / 1000, tz=TZ_CST).strftime("%H:%M")
-        end_time = "24:00" if end_ms == day_end_ms else datetime.fromtimestamp(end_ms / 1000, tz=TZ_CST).strftime("%H:%M")
+        busy_intervals.append((start_ms, end_ms))
         suffix = " [跨天截断]" if cross_day else ""
-        print(f"  {start_time}~{end_time}  [{cal_name}]  {title}{suffix}")
-
-    if not rows:
-        print("当天无有效事件（含时间的），无需写入。")
-        return
+        print(f"  {fmt_time(start_ms, day_start_ms, day_end_ms)}~{fmt_time(end_ms, day_start_ms, day_end_ms)}  [{cal_name}]  {title}{suffix}")
 
     print(f"\n共 {len(rows)} 条有效事件")
 
-    # 4. 确保 角色分类 字段包含所有日历名称 option
-    needed_cal_names = list({row[4] for row in rows})  # index 4 = 角色分类
+    # 4. 计算空白段：重叠合并后取补集，与真实事件拼成完整 24h
+    blank_slots = compute_blank_slots(busy_intervals, day_start_ms, day_end_ms)
+    blank_rows = []
+    for s, e in blank_slots:
+        blank_rows.append([BLANK_TITLE, day_start_ms, s, e, BLANK_TITLE, "Google Calendar", ""])
+        print(f"  {fmt_time(s, day_start_ms, day_end_ms)}~{fmt_time(e, day_start_ms, day_end_ms)}  [空白]  {BLANK_TITLE}")
+
+    total_rows = rows + blank_rows
+    print(f"\n共 {len(blank_slots)} 段空白，合计 {len(total_rows)} 条记录覆盖 24 小时")
+
+    if failed_cals:
+        print(f"\n⚠️  {len(failed_cals)} 个日历拉取失败：{', '.join(failed_cals)}", file=sys.stderr)
+        print(f"    以上日历事件未计入，其时段已被算作空白", file=sys.stderr)
+
+    if not total_rows:
+        print("当天无任何记录可写入。")
+        return
+
+    # 5. 确保 角色分类 字段包含所有日历名称 + 空白 option（blank_rows 已带入 BLANK_TITLE）
+    needed_cal_names = list({row[4] for row in total_rows})  # index 4 = 角色分类
     if not ensure_select_options(needed_cal_names, dry_run):
         sys.exit(1)
 
-    # 5. 去重：删除当天已有记录
+    # 6. 去重：删除当天已有记录
     if not dry_run:
         existing_ids = get_existing_record_ids(date_str)
         if existing_ids:
             print(f"删除已有 {len(existing_ids)} 条旧记录...")
             delete_records(existing_ids)
 
-    # 6. 分批写入（每批 ≤ 500）
+    # 7. 分批写入（每批 ≤ 500）
     batch_size = 500
-    for i in range(0, len(rows), batch_size):
-        batch = rows[i:i + batch_size]
+    for i in range(0, len(total_rows), batch_size):
+        batch = total_rows[i:i + batch_size]
         ok = batch_create_records(batch, dry_run)
         if not ok:
             sys.exit(1)
 
+    # 8. 回读校验：当天记录数应 == 真实事件 + 空白段
     if not dry_run:
-        print(f"✅ 已写入 {len(rows)} 条记录到飞书多维表格")
+        actual_ids = get_existing_record_ids(date_str)
+        expected = len(total_rows)
+        if len(actual_ids) == expected:
+            print(f"✅ 已写入 {len(rows)} 条事件 + {len(blank_slots)} 段空白 = {expected} 条记录，回读校验通过")
+        else:
+            print(f"⚠️  回读校验失败：预期 {expected} 条，实际 {len(actual_ids)} 条（可能为写入延迟，请人工核对）", file=sys.stderr)
 
 
 if __name__ == "__main__":
