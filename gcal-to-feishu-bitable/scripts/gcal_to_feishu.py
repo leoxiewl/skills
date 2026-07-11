@@ -54,51 +54,74 @@ def _parse_gws_json(raw_stdout):
         return None
 
 
-def check_gws_auth():
-    """检查 gws 认证状态。token 失效时自动执行 gws auth login 引导用户完成 OAuth。
-    返回 True 表示认证可用，False 表示不可用。
+def _run_gws_auth_login():
+    """运行 gws auth login，自动检测 stdout 中的 OAuth URL 并用浏览器打开。
+    返回 True 表示成功，False 表示失败。
     """
-    result = subprocess.run(
-        ["gws", "auth", "status"],
-        capture_output=True, text=True, timeout=15, env=GWS_ENV
-    )
-    output = result.stdout + result.stderr
+    import webbrowser
+    import re
 
-    is_valid = False
-    status = _parse_gws_json(output)
-    if isinstance(status, dict):
-        is_valid = status.get("token_valid", False)
-
-    if is_valid:
-        return True
-
-    # token 失效，引导用户重新认证
     print("⚠️  gws Token 已失效，正在启动重新认证流程...")
-    print("请在弹出的浏览器窗口中完成 Google OAuth 授权，授权后回到终端继续。")
+    print("浏览器会自动打开 Google 授权页面，完成授权后回到终端继续。")
     print()
 
-    # gws auth login 需要终端交互，不能 capture_output
-    login_result = subprocess.run(
+    proc = subprocess.Popen(
         ["gws", "auth", "login"],
-        timeout=180, env=GWS_ENV
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=GWS_ENV
     )
-
-    if login_result.returncode != 0:
-        print("❌ gws auth login 执行失败，请手动运行：gws auth login", file=sys.stderr)
+    url_opened = False
+    try:
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                if proc.poll() is not None:
+                    break
+                continue
+            print(line, end='')
+            if not url_opened:
+                match = re.search(r'(https://\S+)', line)
+                if match:
+                    url = match.group(1)
+                    print(f"\n🌐 自动打开浏览器进行 Google OAuth 授权...\n")
+                    webbrowser.open(url)
+                    url_opened = True
+    except KeyboardInterrupt:
+        proc.kill()
         return False
 
-    # 再次检查
-    result = subprocess.run(
-        ["gws", "auth", "status"],
-        capture_output=True, text=True, timeout=15, env=GWS_ENV
-    )
-    status = _parse_gws_json(result.stdout + result.stderr)
-    if isinstance(status, dict) and status.get("token_valid", False):
-        print("✅ 认证成功，继续执行同步...")
-        return True
+    try:
+        proc.wait(timeout=300)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        print("⚠️  gws auth login 超时（300s），但可能已完成授权", file=sys.stderr)
 
-    print("❌ 重新认证后 token 仍无效，请手动检查：gws auth status", file=sys.stderr)
-    return False
+    return proc.returncode == 0
+
+
+def try_get_calendars_with_auth():
+    """获取日历列表，认证失败时自动引导重新登录并重试。
+    返回日历列表 [(name, id), ...]，失败时返回 None。
+    """
+    # 第一次尝试
+    calendars = get_calendar_list()
+    if calendars:
+        return calendars
+
+    # 失败 → 可能是认证问题，尝试重新登录
+    print("\n获取日历列表失败，尝试重新认证 gws...\n")
+    if not _run_gws_auth_login():
+        print("❌ gws auth login 失败，请手动运行：gws auth login", file=sys.stderr)
+        return None
+
+    # 重试
+    print("✅ 认证完成，重新获取日历列表...")
+    calendars = get_calendar_list()
+    if calendars:
+        return calendars
+
+    print("❌ 重新认证后仍无法获取日历列表，请检查网络或手动运行 gws auth status", file=sys.stderr)
+    return None
 
 
 def run_gws(args):
@@ -283,14 +306,9 @@ def main():
 
     print(f"目标日期: {date_str}{'  [dry-run]' if dry_run else ''}")
 
-    # 0. 检查 gws 认证状态（失效时自动引导重新登录）
-    if not check_gws_auth():
-        sys.exit(1)
-
-    # 1. 获取日历列表 (同时预热 discovery)
-    calendars = get_calendar_list()
+    # 1. 获取日历列表（认证失败时自动引导重新登录并重试）
+    calendars = try_get_calendars_with_auth()
     if not calendars:
-        print("无法获取日历列表，请检查 gws 认证状态或网络连接。", file=sys.stderr)
         sys.exit(1)
     targets = [(name, cid) for name, cid in calendars if name not in SKIP_CALENDARS]
     if not targets:
