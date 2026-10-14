@@ -4,11 +4,13 @@
 
 ## 目录
 
-- `gcal-to-feishu-bitable/` — 谷歌日历事件同步到飞书多维表格
-- `gcal-role-time-daily-review/` — 按角色日历汇总时间、追加到当天日记
-- `feishu-movie-tracker/` — 飞书追剧记录
-- `feishu-subscription-tracker/` — 飞书订阅记录
-- `开发一个软件的流程步骤/` — 软件开发流程 SOP（多步骤 Skill）
+- `skills/gcal-to-feishu-bitable/` — 谷歌日历事件同步到飞书多维表格
+- `skills/gcal-role-time-daily-review/` — 按角色日历汇总时间、追加到当天日记
+- `skills/feishu-movie-tracker/` — 飞书追剧记录
+- `skills/feishu-subscription-tracker/` — 飞书订阅记录
+- `skills/开发一个软件的流程步骤/` — 软件开发流程 SOP（多步骤 Skill）
+
+所有 Skill 统一放在仓库根目录的 `skills/` 下，每个子目录一个 Skill（含 `SKILL.md` 及配套 `scripts/` 等资源）。
 
 ## 与父仓库的关系
 
